@@ -1,5 +1,5 @@
 [package]
-name = "identity-system"
+name = "dilithium"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

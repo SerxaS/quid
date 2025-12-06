@@ -3,9 +3,5 @@
 version = 4
 
 [[package]]
-name = "identity-system"
-version = "0.1.0"
-
-[[package]]
-name = "sphincs-plus"
+name = "dilithium"
 version = "0.1.0"
