@@ -48,6 +48,22 @@ pub fn bits_to_bytes(y: &[u8]) -> Vec<u8> {
     z
 }
 
+/// Algorithm 13
+pub fn bytes_to_bits(z: Vec<u8>) -> Vec<u8> {
+    let alpha = z.len();
+    let len = 8 * alpha;
+    let mut y = vec![0u8; len];
+    let mut z_prime = z;
+
+    for i in 0..alpha {
+        for j in 0..8 {
+            y[8 * i + j] = z_prime[i] % 2;
+            z_prime[i] = z_prime[i] / 2;
+        }
+    }
+
+    y
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +103,15 @@ mod tests {
         let y = [0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0];
         let result = bits_to_bytes(&y);
         let expected = vec![102, 6];
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn bytes_to_bits_test() {
+        let z = vec![102, 6];
+        let result = bytes_to_bits(z);
+        let expected = [0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0];
 
         assert_eq!(result, expected);
     }
