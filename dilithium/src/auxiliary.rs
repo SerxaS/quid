@@ -1,4 +1,4 @@
-use crate::constants::{OMEGA, Q};
+use crate::constants::{ETA, GAMMA1, GAMMA2, K, L, LAMBDA, OMEGA, Q};
 
 type Polynomial = [u8; 256];
 
@@ -82,10 +82,10 @@ pub fn coeff_from_three_bytes(b0: u8, b1: u8, b2: u8) -> Option<u32> {
 }
 
 /// Algorithm 15
-pub fn coeff_from_half_byte(b: u8, eta: u32) -> Option<i32> {
-    if eta == 2 && b < 15 {
+pub fn coeff_from_half_byte(b: u8) -> Option<i32> {
+    if ETA == 2 && b < 15 {
         Some(2 - (b % 5) as i32)
-    } else if eta == 4 && b < 9 {
+    } else if ETA == 4 && b < 9 {
         Some(4 - b as i32)
     } else {
         None
@@ -210,6 +210,212 @@ pub fn hint_bit_unpack(y: &[u8], k: usize, omega: usize) -> Option<Vec<Polynomia
     Some(h)
 }
 
+/// Algorithm 22
+pub fn pk_encode(rho: &[u8; 32], t1: &[Polynomial]) -> Vec<u8> {
+    let mut pk = rho.to_vec();
+
+    for i in 0..K {
+        let mut w = [0u32; 256];
+        for j in 0..256 {
+            w[j] = t1[i][j] as u32;
+        }
+
+        let b = (1u32 << (bitlen(Q - 1) - 13)) - 1;
+        pk.extend_from_slice(&simple_bit_pack(&w, b));
+    }
+
+    pk
+}
+
+/// Algorithm 23
+pub fn pk_decode(pk: &[u8]) -> ([u8; 32], Vec<Polynomial>) {
+    let mut rho = [0u8; 32];
+    rho.copy_from_slice(&pk[0..32]);
+
+    let b = (1u32 << (bitlen(Q - 1) - 13)) - 1;
+    let chunk_size = 32 * bitlen(b);
+    let mut t1 = vec![[0u8; 256]; K];
+
+    for i in 0..K {
+        let start = 32 + i * chunk_size;
+        let end = start + chunk_size;
+        let w = simple_bit_unpack(&pk[start..end], b);
+
+        for j in 0..256 {
+            t1[i][j] = w[j] as u8;
+        }
+    }
+
+    (rho, t1)
+}
+
+/// Algorithm 24
+pub fn sk_encode(
+    rho: &[u8; 32],
+    k_seed: &[u8; 32],
+    tr: &[u8; 64],
+    s1: &[Polynomial],
+    s2: &[Polynomial],
+    t0: &[Polynomial],
+) -> Vec<u8> {
+    let mut sk = Vec::new();
+
+    sk.extend_from_slice(rho);
+    sk.extend_from_slice(k_seed);
+    sk.extend_from_slice(tr);
+
+    for i in 0..L {
+        let mut w = [0i32; 256];
+
+        for j in 0..256 {
+            w[j] = s1[i][j] as i8 as i32;
+        }
+        sk.extend_from_slice(&bit_pack(&w, ETA, ETA));
+    }
+
+    for i in 0..K {
+        let mut w = [0i32; 256];
+
+        for j in 0..256 {
+            w[j] = s2[i][j] as i8 as i32;
+        }
+        sk.extend_from_slice(&bit_pack(&w, ETA, ETA));
+    }
+
+    for i in 0..K {
+        let mut w = [0i32; 256];
+
+        for j in 0..256 {
+            w[j] = t0[i][j] as i8 as i32;
+        }
+        let a = (1u32 << 12) - 1;
+        let b = 1u32 << 12;
+        sk.extend_from_slice(&bit_pack(&w, a, b));
+    }
+
+    sk
+}
+
+/// Algorithm 25
+pub fn sk_decode(
+    sk: &[u8],
+) -> (
+    [u8; 32],
+    [u8; 32],
+    [u8; 64],
+    Vec<Polynomial>,
+    Vec<Polynomial>,
+    Vec<Polynomial>,
+) {
+    let mut rho = [0u8; 32];
+    let mut k_seed = [0u8; 32];
+    let mut tr = [0u8; 64];
+
+    rho.copy_from_slice(&sk[0..32]);
+    k_seed.copy_from_slice(&sk[32..64]);
+    tr.copy_from_slice(&sk[64..128]);
+
+    let mut pos = 128;
+
+    let mut s1 = vec![[0u8; 256]; L];
+    let s_chunk_size = 32 * bitlen(2 * ETA);
+
+    for i in 0..L {
+        let chunk = &sk[pos..pos + s_chunk_size];
+        let w = bit_unpack(chunk, ETA, ETA);
+
+        for j in 0..256 {
+            s1[i][j] = w[j] as i8 as u8;
+        }
+        pos += s_chunk_size;
+    }
+    let mut s2 = vec![[0u8; 256]; K];
+
+    for i in 0..K {
+        let chunk = &sk[pos..pos + s_chunk_size];
+        let w = bit_unpack(chunk, ETA, ETA);
+        for j in 0..256 {
+            s2[i][j] = w[j] as i8 as u8;
+        }
+        pos += s_chunk_size;
+    }
+
+    let mut t0 = vec![[0u8; 256]; K];
+    let a = (1u32 << 12) - 1;
+    let b = 1u32 << 12;
+    let t_chunk_size = 32 * bitlen(a + b);
+
+    for i in 0..K {
+        let chunk = &sk[pos..pos + t_chunk_size];
+        let w = bit_unpack(chunk, a, b);
+        for j in 0..256 {
+            t0[i][j] = w[j] as i8 as u8;
+        }
+        pos += t_chunk_size;
+    }
+
+    (rho, k_seed, tr, s1, s2, t0)
+}
+
+/// Algorithm 26
+pub fn sig_encode(c_tilde: &[u8], z: &[Polynomial], h: &[Polynomial]) -> Vec<u8> {
+    let mut sigma = c_tilde.to_vec();
+
+    for i in 0..L {
+        let mut w = [0i32; 256];
+        for j in 0..256 {
+            w[j] = z[i][j] as i8 as i32;
+        }
+        sigma.extend_from_slice(&bit_pack(&w, GAMMA1 - 1, GAMMA1));
+    }
+
+    sigma.extend_from_slice(&hint_bit_pack(h));
+
+    sigma
+}
+
+/// Algorithm 27
+pub fn sig_decode(sigma: &[u8]) -> Option<(Vec<u8>, Vec<Polynomial>, Vec<Polynomial>)> {
+    let c_tilde_len = LAMBDA / 4;
+    let c_tilde = sigma[0..c_tilde_len].to_vec();
+
+    let mut pos = c_tilde_len;
+
+    let mut z = vec![[0u8; 256]; L];
+    let z_chunk_size = 32 * (1 + bitlen(GAMMA1 - 1));
+    for i in 0..L {
+        let chunk = &sigma[pos..pos + z_chunk_size];
+        let w = bit_unpack(chunk, GAMMA1 - 1, GAMMA1);
+        for j in 0..256 {
+            z[i][j] = w[j] as i8 as u8;
+        }
+        pos += z_chunk_size;
+    }
+
+    // Decode h
+    let h_bytes = &sigma[pos..];
+    let h = hint_bit_unpack(h_bytes, K, OMEGA)?;
+
+    Some((c_tilde, z, h))
+}
+
+/// Algorithm 28
+pub fn w1_encode(w1: &[Polynomial]) -> Vec<u8> {
+    let mut w1_tilde = Vec::new();
+
+    for i in 0..K {
+        let mut w = [0u32; 256];
+        for j in 0..256 {
+            w[j] = w1[i][j] as u32;
+        }
+
+        let b = (Q - 1) / (2 * GAMMA2) - 1;
+        w1_tilde.extend_from_slice(&simple_bit_pack(&w, b));
+    }
+
+    w1_tilde
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,26 +486,16 @@ mod tests {
     #[test]
     fn coeff_from_half_byte_test() {
         // η = 2 tests
-        assert_eq!(coeff_from_half_byte(0, 2), Some(2));
-        assert_eq!(coeff_from_half_byte(1, 2), Some(1));
-        assert_eq!(coeff_from_half_byte(2, 2), Some(0));
-        assert_eq!(coeff_from_half_byte(3, 2), Some(-1));
-        assert_eq!(coeff_from_half_byte(4, 2), Some(-2));
-        assert_eq!(coeff_from_half_byte(14, 2), Some(-2));
-        assert_eq!(coeff_from_half_byte(15, 2), None);
-
-        // η = 4 tests
-        assert_eq!(coeff_from_half_byte(0, 4), Some(4));
-        assert_eq!(coeff_from_half_byte(4, 4), Some(0));
-        assert_eq!(coeff_from_half_byte(8, 4), Some(-4));
-        assert_eq!(coeff_from_half_byte(9, 4), None);
+        assert_eq!(coeff_from_half_byte(0), Some(2));
+        assert_eq!(coeff_from_half_byte(1), Some(1));
+        assert_eq!(coeff_from_half_byte(2), Some(0));
+        assert_eq!(coeff_from_half_byte(3), Some(-1));
+        assert_eq!(coeff_from_half_byte(4), Some(-2));
+        assert_eq!(coeff_from_half_byte(14), Some(-2));
+        assert_eq!(coeff_from_half_byte(15), None);
 
         // Edge case: b > 15
-        assert_eq!(coeff_from_half_byte(16, 2), None);
-        assert_eq!(coeff_from_half_byte(255, 4), None);
-
-        // Edge case: invalid eta
-        assert_eq!(coeff_from_half_byte(5, 3), None);
+        assert_eq!(coeff_from_half_byte(16), None);
     }
 
     #[test]
@@ -415,5 +611,59 @@ mod tests {
 
         let result = hint_bit_unpack(&y, k, omega);
         assert!(result.is_none()); // Should return ⊥
+    }
+
+    #[test]
+    fn pk_encode_decode_test() {
+        let rho = [42u8; 32];
+        let t1 = vec![[5u8; 256]; K];
+
+        let encoded = pk_encode(&rho, &t1);
+        let (rho_decoded, t1_decoded) = pk_decode(&encoded);
+
+        assert_eq!(rho, rho_decoded);
+        assert_eq!(t1[0][0], t1_decoded[0][0]);
+    }
+
+    #[test]
+    fn sk_encode_decode_test() {
+        let rho = [1u8; 32];
+        let k_seed = [2u8; 32];
+        let tr = [3u8; 64];
+        let s1 = vec![[0u8; 256]; L];
+        let s2 = vec![[0u8; 256]; K];
+        let t0 = vec![[0u8; 256]; K];
+
+        let encoded = sk_encode(&rho, &k_seed, &tr, &s1, &s2, &t0);
+        let (rho_dec, k_dec, tr_dec, _, _, _) = sk_decode(&encoded);
+
+        assert_eq!(rho, rho_dec);
+        assert_eq!(k_seed, k_dec);
+        assert_eq!(tr, tr_dec);
+    }
+
+    #[test]
+    fn sig_encode_decode_test() {
+        let c_tilde = vec![7u8; 32];
+        let l = 4;
+        let z = vec![[1u8; 256]; l];
+        let h = vec![[0u8; 256]; K];
+
+        let encoded = sig_encode(&c_tilde, &z, &h);
+        let decoded = sig_decode(&encoded);
+
+        assert!(decoded.is_some());
+        let (c_dec, _, _) = decoded.unwrap();
+        assert_eq!(c_tilde, c_dec);
+    }
+
+    #[test]
+    fn w1_encode_test() {
+        let w1 = vec![[5u8; 256]; K];
+        let encoded = w1_encode(&w1);
+
+        let b = (Q - 1) / (2 * GAMMA2) - 1;
+        let expected_len = 32 * K * bitlen(b);
+        assert_eq!(encoded.len(), expected_len);
     }
 }
