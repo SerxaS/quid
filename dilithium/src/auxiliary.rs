@@ -1,4 +1,9 @@
-use crate::constants::{ETA, GAMMA1, GAMMA2, K, L, LAMBDA, OMEGA, Q};
+use sha3::{
+    Shake128, Shake256,
+    digest::{ExtendableOutput, Update, XofReader},
+};
+
+use crate::constants::{ETA, GAMMA1, GAMMA2, K, L, LAMBDA, OMEGA, Q, TAU};
 
 type Polynomial = [u8; 256];
 
@@ -416,6 +421,164 @@ pub fn w1_encode(w1: &[Polynomial]) -> Vec<u8> {
     w1_tilde
 }
 
+/// Algorithm 29
+pub fn sample_in_ball(rho: &[u8]) -> [i32; 256] {
+    let mut c = [0i32; 256];
+
+    let mut hasher = Shake256::default();
+    hasher.update(rho);
+    let mut ctx = hasher.finalize_xof();
+
+    let mut s = [0u8; 8];
+    ctx.read(&mut s);
+    let h = bytes_to_bits(s.to_vec());
+
+    for i in (256 - TAU)..256 {
+        let mut j_bytes = [0u8; 1];
+        ctx.read(&mut j_bytes);
+        let mut j = j_bytes[0] as usize;
+
+        while j > i {
+            ctx.read(&mut j_bytes);
+            j = j_bytes[0] as usize;
+        }
+
+        c[i] = c[j];
+        c[j] = if h[i + TAU - 256] == 0 { 1 } else { -1 };
+    }
+
+    c
+}
+
+/// Algorithm 30
+pub fn rej_ntt_poly(rho: &[u8; 34]) -> [u32; 256] {
+    let mut a_hat = [0u32; 256];
+    let mut j = 0;
+
+    let mut hasher = Shake128::default();
+    hasher.update(rho);
+    let mut ctx = hasher.finalize_xof();
+
+    while j < 256 {
+        let mut s = [0u8; 3];
+        ctx.read(&mut s);
+
+        if let Some(coeff) = coeff_from_three_bytes(s[0], s[1], s[2]) {
+            a_hat[j] = coeff;
+            j += 1;
+        }
+    }
+
+    a_hat
+}
+
+/// Algorithm 31
+pub fn rej_bounded_poly(rho: &[u8; 66]) -> [i32; 256] {
+    let mut a = [0i32; 256];
+    let mut j = 0;
+
+    let mut hasher = Shake256::default();
+    hasher.update(rho);
+    let mut ctx = hasher.finalize_xof();
+
+    while j < 256 {
+        let mut z_byte = [0u8; 1];
+        ctx.read(&mut z_byte);
+        let z = z_byte[0];
+
+        let z0 = coeff_from_half_byte(z & 0x0F);
+        let z1 = coeff_from_half_byte(z >> 4);
+
+        if let Some(coeff) = z0 {
+            a[j] = coeff;
+            j += 1;
+        }
+
+        if let Some(coeff) = z1 {
+            if j < 256 {
+                a[j] = coeff;
+                j += 1;
+            }
+        }
+    }
+
+    a
+}
+
+/// Algorithm 32
+pub fn expand_a(rho: &[u8; 32]) -> Vec<Vec<[u32; 256]>> {
+    let mut a_hat = vec![vec![[0u32; 256]; L]; K];
+
+    for r in 0..K {
+        for s in 0..L {
+            let mut rho_prime = rho.to_vec();
+            rho_prime.extend_from_slice(&integer_to_bytes(s as u32, 1));
+            rho_prime.extend_from_slice(&integer_to_bytes(r as u32, 1));
+
+            let mut rho_prime_array = [0u8; 34];
+            rho_prime_array.copy_from_slice(&rho_prime);
+
+            a_hat[r][s] = rej_ntt_poly(&rho_prime_array);
+        }
+    }
+
+    a_hat
+}
+
+/// Algorithm 33
+pub fn expand_s(rho: &[u8; 64]) -> (Vec<[i32; 256]>, Vec<[i32; 256]>) {
+    let mut s1 = vec![[0i32; 256]; L];
+    let mut s2 = vec![[0i32; 256]; K];
+
+    let mut rho_array = [0u8; 66];
+    rho_array[..64].copy_from_slice(rho);
+
+    for r in 0..L {
+        let r_bytes = integer_to_bytes(r as u32, 2);
+        rho_array[64] = r_bytes[0];
+        rho_array[65] = r_bytes[1];
+
+        s1[r] = rej_bounded_poly(&rho_array);
+    }
+
+    for r in 0..K {
+        let r_bytes = integer_to_bytes((r + L) as u32, 2);
+        rho_array[64] = r_bytes[0];
+        rho_array[65] = r_bytes[1];
+
+        s2[r] = rej_bounded_poly(&rho_array);
+    }
+
+    (s1, s2)
+}
+
+/// Algorithm 34
+pub fn expand_mask(rho: &[u8; 64], mu: usize) -> Vec<[i32; 256]> {
+    let c = 1 + bitlen(GAMMA1 - 1);
+    let mut y = vec![[0i32; 256]; L];
+
+    let mut rho_prime = [0u8; 66];
+    rho_prime[..64].copy_from_slice(rho);
+
+    let mut v = vec![0u8; 32 * c];
+
+    for r in 0..L {
+        let r_bytes = integer_to_bytes((mu + r) as u32, 2);
+        rho_prime[64] = r_bytes[0];
+        rho_prime[65] = r_bytes[1];
+
+        let mut hasher = Shake256::default();
+        hasher.update(&rho_prime);
+        let mut ctx = hasher.finalize_xof();
+
+        ctx.read(&mut v);
+
+        y[r] = bit_unpack(&v, GAMMA1 - 1, GAMMA1);
+    }
+
+    y
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,8 +808,7 @@ mod tests {
     #[test]
     fn sig_encode_decode_test() {
         let c_tilde = vec![7u8; 32];
-        let l = 4;
-        let z = vec![[1u8; 256]; l];
+        let z = vec![[1u8; 256]; L];
         let h = vec![[0u8; 256]; K];
 
         let encoded = sig_encode(&c_tilde, &z, &h);
@@ -665,5 +827,94 @@ mod tests {
         let b = (Q - 1) / (2 * GAMMA2) - 1;
         let expected_len = 32 * K * bitlen(b);
         assert_eq!(encoded.len(), expected_len);
+    }
+
+    #[test]
+    fn sample_in_ball_test() {
+        let rho = [0u8; 32];
+        let c = sample_in_ball(&rho);
+
+        let mut count = 0;
+        for &coeff in &c {
+            assert!(coeff == -1 || coeff == 0 || coeff == 1);
+            if coeff != 0 {
+                count += 1;
+            }
+        }
+
+        assert_eq!(count, TAU);
+    }
+
+    #[test]
+    fn rej_ntt_poly_test() {
+        let rho = [1u8; 34];
+        let a_hat = rej_ntt_poly(&rho);
+
+        for &coeff in &a_hat {
+            assert!(coeff < Q);
+        }
+    }
+
+    #[test]
+    fn rej_bounded_poly_test() {
+        let rho = [2u8; 66];
+        let a = rej_bounded_poly(&rho);
+
+        for &coeff in &a {
+            assert!(coeff >= -(ETA as i32) && coeff <= (ETA as i32));
+        }
+    }
+
+    #[test]
+    fn expand_a_test() {
+        let rho = [3u8; 32];
+        let a_hat = expand_a(&rho);
+
+        assert_eq!(a_hat.len(), K);
+        assert_eq!(a_hat[0].len(), L);
+
+        for i in 0..K {
+            for j in 0..L {
+                for &coeff in &a_hat[i][j] {
+                    assert!(coeff < Q);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expand_s_test() {
+        let rho = [4u8; 64];
+        let (s1, s2) = expand_s(&rho);
+
+        assert_eq!(s1.len(), L);
+        assert_eq!(s2.len(), K);
+
+        for poly in &s1 {
+            for &coeff in poly {
+                assert!(coeff >= -(ETA as i32) && coeff <= (ETA as i32));
+            }
+        }
+
+        for poly in &s2 {
+            for &coeff in poly {
+                assert!(coeff >= -(ETA as i32) && coeff <= (ETA as i32));
+            }
+        }
+    }
+
+    #[test]
+    fn expand_mask_test() {
+        let rho = [8u8; 64];
+        let mu = 0;
+        let y = expand_mask(&rho, mu);
+
+        assert_eq!(y.len(), L);
+
+        for poly in &y {
+            for &coeff in poly {
+                assert!(coeff >= -(GAMMA1 as i32) + 1 && coeff <= GAMMA1 as i32);
+            }
+        }
     }
 }
